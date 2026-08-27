@@ -5,35 +5,32 @@ type MessageHandler = (peerId: string, message: DataChannelMessage) => void;
 type StateHandler = (peerId: string, state: RTCPeerConnectionState) => void;
 type IceCandidateHandler = (peerId: string, candidate: RTCIceCandidate) => void;
 
-// ICE servers: STUN for public discovery, relay candidates for same-machine
-const ICE_SERVERS: RTCIceServer[] = [
-  // Google STUN servers
-  { urls: "stun:stun.l.google.com:19302" },
-  { urls: "stun:stun1.l.google.com:19302" },
-  // Open relay STUN (free, helps with same-machine)
-  { urls: "stun:openrelay.metered.ca:80" },
-  { urls: "stun:stun.l.google.com:5349" },
+// TURN servers for relay (cross-network)
+const TURN_SERVERS: RTCIceServer[] = [
+  // OpenRelay TURN (metered.ca) — multiple endpoints
+  {
+    urls: [
+      "turn:openrelay.metered.ca:80",
+      "turn:openrelay.metered.ca:443",
+      "turn:openrelay.metered.ca:443?transport=tcp",
+      "turn:openrelay.metered.ca:80?transport=tcp",
+    ],
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
 ];
 
-// When same-machine, we also try to get relay candidates
+// STUN servers for candidate gathering
+const STUN_SERVERS: RTCIceServer[] = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+  { urls: "stun:openrelay.metered.ca:80" },
+];
+
+// Combined: STUN + TURN for best connectivity
 const RELAY_SERVERS: RTCIceServer[] = [
-  ...ICE_SERVERS,
-  // Free OpenRelay TURN (metered.ca)
-  {
-    urls: "turn:openrelay.metered.ca:80",
-    username: "openrelayproject",
-    credential: "openrelayproject",
-  },
-  {
-    urls: "turn:openrelay.metered.ca:443",
-    username: "openrelayproject",
-    credential: "openrelayproject",
-  },
-  {
-    urls: "turn:openrelay.metered.ca:443?transport=tcp",
-    username: "openrelayproject",
-    credential: "openrelayproject",
-  },
+  ...STUN_SERVERS,
+  ...TURN_SERVERS,
 ];
 
 const DATA_CHANNEL_LABEL = "airshare-data";
@@ -214,11 +211,10 @@ export class WebRTCManager {
     let pc = this.peers.get(peerId);
     if (pc) return pc;
 
-    // Use relay servers for better same-machine compatibility
+    // Use relay servers for cross-network reliability
     const config: RTCConfiguration = {
       iceServers: RELAY_SERVERS,
       iceCandidatePoolSize: 10,
-      // Force relay for same-machine (helps with NAT)
       iceTransportPolicy: "all",
     };
 
@@ -235,8 +231,12 @@ export class WebRTCManager {
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        console.log("[WebRTC] ICE candidate:", event.candidate.type, "for", peerId);
+        const type = event.candidate.type || "unknown";
+        const proto = event.candidate.protocol || "?";
+        console.log(`[WebRTC] ICE candidate: ${type} (${proto}) for`, peerId);
         this.iceCandidateHandlers.forEach((h) => h(peerId, event.candidate!));
+      } else {
+        console.log("[WebRTC] ICE gathering complete for", peerId);
       }
     };
 
