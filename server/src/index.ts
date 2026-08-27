@@ -4,6 +4,7 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
+import path from "node:path";
 import { handleConnection } from "./handlers/connection.js";
 import { peerManager } from "./services/peerManager.js";
 import { roomManager } from "./services/roomManager.js";
@@ -75,9 +76,10 @@ app.get("/health", (_req, res) => {
 
 // ─── Static Files (production) ─────────────────────────────
 
-app.use(express.static("public"));
+const publicPath = path.join(process.cwd(), "public");
+app.use(express.static(publicPath));
 app.get("*", (_req, res) => {
-  res.sendFile("public/index.html", { root: process.cwd() });
+  res.sendFile(path.join(publicPath, "index.html"));
 });
 
 // ─── Error Handler ─────────────────────────────────────────
