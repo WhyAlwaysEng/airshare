@@ -144,6 +144,8 @@ export function useFileTransfer() {
   const acceptTransfer = useCallback(
     async (serverTransferId: string, peerId: string) => {
       console.log("[Transfer] ✅ Accepting from", peerId);
+      // Save pending data BEFORE clearing
+      const pending = useAppStore.getState().pendingConsentRequest;
       setPendingConsentRequest(null);
 
       // RECEIVER waits for DataChannel (sender will create offer)
@@ -176,7 +178,6 @@ export function useFileTransfer() {
       receiver.start();
       receiver.acceptFile(serverTransferId, 0);
 
-      const pending = useAppStore.getState().pendingConsentRequest;
       addTransfer({
         id: clientTransferId,
         direction: "receive",
