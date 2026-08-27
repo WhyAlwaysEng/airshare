@@ -155,17 +155,17 @@ export function useFileTransfer() {
         accepted: true,
       });
 
-      // Step 2: RECEIVER waits for DataChannel (sender will create offer)
-      console.log("[Transfer] ⏳ Waiting for WebRTC connection (receiver)...");
+      // Step 2: RECEIVER waits for sender's offer (don't create offer!)
+      console.log("[Transfer] ⏳ Waiting for sender's WebRTC offer...");
       try {
-        await waitForDataChannel(peerId);
+        await waitForSenderOffer(peerId);
       } catch (err) {
         console.error("[Transfer] ❌ WebRTC failed on receiver:", err);
         addToast({ type: "error", title: "Connection failed" });
         return;
       }
 
-      // Create receiver and accept
+      // Step 3: Create receiver and accept
       const clientTransferId = `recv_${++transferIdCounter}`;
       const receiver = new FileReceiver(peerId, {
         onProgress: (fileIndex, progress) => {
@@ -264,6 +264,59 @@ async function waitForDataChannel(peerId: string): Promise<void> {
     const unsubState = webrtc.onStateChange((pid, state) => {
       if (pid === peerId) {
         console.log("[WebRTC] State:", state, "for", peerId);
+        if (state === "connected") {
+          const ch = (webrtc as any).channels.get(peerId);
+          if (ch?.readyState === "open") {
+            clearTimeout(timeout);
+            unsub();
+            unsubState();
+            resolve();
+          }
+        } else if (state === "failed") {
+          clearTimeout(timeout);
+          unsub();
+          unsubState();
+          reject(new Error("WebRTC connection failed"));
+        }
+      }
+    });
+  });
+}
+
+// ─── Wait for sender's offer (receiver side) ────────────
+// Receiver does NOT create an offer, just waits for DataChannel
+async function waitForSenderOffer(peerId: string): Promise<void> {
+  const webrtc = getWebRTCManager();
+
+  // Check if already connected
+  const existingChannel = (webrtc as any).channels.get(peerId);
+  if (existingChannel?.readyState === "open") {
+    console.log("[WebRTC] ✅ Already connected to", peerId);
+    return;
+  }
+
+  // Wait for DataChannel to open (sender creates offer, we just wait)
+  console.log("[WebRTC] ⏳ Waiting for sender's offer...");
+  return new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      unsub();
+      unsubState();
+      console.error("[WebRTC] ❌ Timeout waiting for sender");
+      reject(new Error("Timeout waiting for sender (20s)"));
+    }, 20000);
+
+    const unsub = webrtc.onChannel((pid, _channel) => {
+      if (pid === peerId) {
+        console.log("[WebRTC] ✅ DataChannel received from", peerId);
+        clearTimeout(timeout);
+        unsub();
+        unsubState();
+        resolve();
+      }
+    });
+
+    const unsubState = webrtc.onStateChange((pid, state) => {
+      if (pid === peerId) {
         if (state === "connected") {
           const ch = (webrtc as any).channels.get(peerId);
           if (ch?.readyState === "open") {
