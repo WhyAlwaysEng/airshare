@@ -50,8 +50,9 @@ export class FileSender {
     const file = this.files[fileIndex];
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
-    // Compute SHA-256 hash of the entire file
+    console.log("[FileSender] Computing hash for", file.name);
     const sha256 = await computeFileHash(file);
+    console.log("[FileSender] Hash computed, sending metadata");
 
     // Send metadata
     this.webrtc.sendMessage(this.peerId, {
@@ -64,14 +65,17 @@ export class FileSender {
       sha256,
       totalChunks,
     });
+    console.log("[FileSender] Metadata sent, waiting for accept...");
 
     // Wait for accept
     const accepted = await this.waitForAccept(fileIndex);
+    console.log("[FileSender] Accept result:", accepted);
     if (!accepted || this.cancelled) return;
 
     // Send chunks with backpressure
     const startTime = Date.now();
     let bytesSent = 0;
+    console.log(`[FileSender] Starting chunk send: ${totalChunks} chunks, ${file.size} bytes`);
 
     for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
       if (this.cancelled) return;
@@ -83,6 +87,7 @@ export class FileSender {
 
       // Wait for backpressure to clear
       while (!this.webrtc.sendBinary(this.peerId, buffer)) {
+        console.log(`[FileSender] Backpressure: waiting... chunk ${chunkIndex}/${totalChunks}`);
         await this.webrtc.waitForBufferDrain(this.peerId);
         if (this.cancelled) return;
       }
@@ -93,6 +98,10 @@ export class FileSender {
       const elapsed = (Date.now() - startTime) / 1000;
       const speed = elapsed > 0 ? bytesSent / elapsed : 0;
       const progress = (bytesSent / file.size) * 100;
+
+      if (chunkIndex % 10 === 0 || chunkIndex === totalChunks - 1) {
+        console.log(`[FileSender] Sent chunk ${chunkIndex + 1}/${totalChunks} (${Math.round(progress)}%)`);
+      }
 
       this.callbacks.onProgress?.(fileIndex, progress, speed);
     }
