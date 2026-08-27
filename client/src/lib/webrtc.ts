@@ -51,6 +51,9 @@ export class WebRTCManager {
   // ─── Connection Management ─────────────────────────────
 
   async createOffer(peerId: string): Promise<SignalPayload> {
+    // Clean up old PC first
+    this.removePeer(peerId);
+    
     const pc = this.getOrCreatePC(peerId, true); // initiator = true
 
     // Create data channel (offerer creates it)
@@ -67,6 +70,9 @@ export class WebRTCManager {
   }
 
   async handleOffer(peerId: string, sdp: string): Promise<SignalPayload> {
+    // Clean up old PC first
+    this.removePeer(peerId);
+    
     const pc = this.getOrCreatePC(peerId, false); // initiator = false
 
     await pc.setRemoteDescription({ type: "offer", sdp });
