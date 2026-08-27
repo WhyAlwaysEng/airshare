@@ -1,0 +1,18 @@
+{
+  "name": "airshare",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WebRTC P2P File & Clipboard Sharing Web App",
+  "scripts": {
+    "dev": "pnpm --filter server dev & pnpm --filter client dev",
+    "dev:client": "pnpm --filter client dev",
+    "dev:server": "pnpm --filter server dev",
+    "build": "pnpm --filter shared build && pnpm --filter client build && pnpm --filter server build",
+    "build:client": "pnpm --filter client build",
+    "build:server": "pnpm --filter server build",
+    "typecheck": "pnpm --filter server typecheck && pnpm --filter client typecheck"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

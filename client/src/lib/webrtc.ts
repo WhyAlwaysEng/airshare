@@ -1,0 +1,314 @@
+import type { SignalPayload, DataChannelMessage } from "@/types";
+
+type ChannelHandler = (peerId: string, channel: RTCDataChannel) => void;
+type MessageHandler = (peerId: string, message: DataChannelMessage) => void;
+type StateHandler = (peerId: string, state: RTCPeerConnectionState) => void;
+type IceCandidateHandler = (peerId: string, candidate: RTCIceCandidate) => void;
+
+// ICE servers: STUN for public discovery, relay candidates for same-machine
+const ICE_SERVERS: RTCIceServer[] = [
+  // Google STUN servers
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+  // Open relay STUN (free, helps with same-machine)
+  { urls: "stun:openrelay.metered.ca:80" },
+  { urls: "stun:stun.l.google.com:5349" },
+];
+
+// When same-machine, we also try to get relay candidates
+const RELAY_SERVERS: RTCIceServer[] = [
+  ...ICE_SERVERS,
+  // Free OpenRelay TURN (metered.ca)
+  {
+    urls: "turn:openrelay.metered.ca:80",
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
+  {
+    urls: "turn:openrelay.metered.ca:443",
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
+  {
+    urls: "turn:openrelay.metered.ca:443?transport=tcp",
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
+];
+
+const DATA_CHANNEL_LABEL = "airshare-data";
+const CHUNK_SIZE = 32 * 1024; // 32KB chunks
+const BACKPRESSURE_THRESHOLD = 512 * 1024; // 512KB
+const BACKPRESSURE_RESUME_THRESHOLD = 128 * 1024; // 128KB
+
+export class WebRTCManager {
+  private peers = new Map<string, RTCPeerConnection>();
+  private channels = new Map<string, RTCDataChannel>();
+  private pendingCandidates = new Map<string, RTCIceCandidateInit[]>();
+
+  private channelHandlers = new Set<ChannelHandler>();
+  private messageHandlers = new Set<MessageHandler>();
+  private stateHandlers = new Set<StateHandler>();
+  private iceCandidateHandlers = new Set<IceCandidateHandler>();
+
+  // ─── Connection Management ─────────────────────────────
+
+  async createOffer(peerId: string): Promise<SignalPayload> {
+    const pc = this.getOrCreatePC(peerId, true); // initiator = true
+
+    // Create data channel (offerer creates it)
+    const channel = pc.createDataChannel(DATA_CHANNEL_LABEL, {
+      ordered: true,
+    });
+    this.setupChannel(peerId, channel);
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    console.log("[WebRTC] Created offer for", peerId);
+    return { type: "offer", sdp: offer.sdp };
+  }
+
+  async handleOffer(peerId: string, sdp: string): Promise<SignalPayload> {
+    const pc = this.getOrCreatePC(peerId, false); // initiator = false
+
+    await pc.setRemoteDescription({ type: "offer", sdp });
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    console.log("[WebRTC] Created answer for", peerId);
+    return { type: "answer", sdp: answer.sdp };
+  }
+
+  async handleAnswer(peerId: string, sdp: string): Promise<void> {
+    const pc = this.peers.get(peerId);
+    if (!pc) {
+      console.warn("[WebRTC] No PC for answer from", peerId);
+      return;
+    }
+
+    await pc.setRemoteDescription({ type: "answer", sdp });
+    console.log("[WebRTC] Set answer from", peerId);
+    this.flushPendingCandidates(peerId);
+  }
+
+  async addIceCandidate(peerId: string, candidate: RTCIceCandidateInit): Promise<void> {
+    const pc = this.peers.get(peerId);
+    if (!pc) return;
+
+    if (pc.remoteDescription) {
+      await pc.addIceCandidate(candidate);
+    } else {
+      const pending = this.pendingCandidates.get(peerId) || [];
+      pending.push(candidate);
+      this.pendingCandidates.set(peerId, pending);
+    }
+  }
+
+  removePeer(peerId: string) {
+    const pc = this.peers.get(peerId);
+    if (pc) {
+      pc.close();
+      this.peers.delete(peerId);
+    }
+    this.channels.delete(peerId);
+    this.pendingCandidates.delete(peerId);
+  }
+
+  closeAll() {
+    for (const [peerId] of this.peers) {
+      this.removePeer(peerId);
+    }
+  }
+
+  // ─── Data Sending ─────────────────────────────────────
+
+  sendMessage(peerId: string, message: DataChannelMessage) {
+    const channel = this.channels.get(peerId);
+    if (!channel || channel.readyState !== "open") {
+      console.warn("[WebRTC] Channel not open for", peerId);
+      return;
+    }
+    channel.send(JSON.stringify(message));
+  }
+
+  sendBinary(peerId: string, data: ArrayBuffer) {
+    const channel = this.channels.get(peerId);
+    if (!channel || channel.readyState !== "open") {
+      return false;
+    }
+
+    if (channel.bufferedAmount > BACKPRESSURE_THRESHOLD) {
+      return false;
+    }
+
+    channel.send(data);
+    return true;
+  }
+
+  getBufferedAmount(peerId: string): number {
+    const channel = this.channels.get(peerId);
+    return channel?.bufferedAmount || 0;
+  }
+
+  waitForBufferDrain(peerId: string): Promise<void> {
+    return new Promise((resolve) => {
+      const channel = this.channels.get(peerId);
+      if (!channel || channel.readyState !== "open") {
+        resolve();
+        return;
+      }
+
+      if (channel.bufferedAmount <= BACKPRESSURE_RESUME_THRESHOLD) {
+        resolve();
+        return;
+      }
+
+      const handler = () => {
+        if (channel.bufferedAmount <= BACKPRESSURE_RESUME_THRESHOLD) {
+          channel.removeEventListener("bufferedamountlow", handler);
+          resolve();
+        }
+      };
+
+      channel.bufferedAmountLowThreshold = BACKPRESSURE_RESUME_THRESHOLD;
+      channel.addEventListener("bufferedamountlow", handler, { once: true });
+    });
+  }
+
+  getChannelStats(peerId: string) {
+    const channel = this.channels.get(peerId);
+    return channel
+      ? {
+          bufferedAmount: channel.bufferedAmount,
+          readyState: channel.readyState,
+        }
+      : null;
+  }
+
+  // ─── Event Handlers ───────────────────────────────────
+
+  onChannel(handler: ChannelHandler): () => void {
+    this.channelHandlers.add(handler);
+    return () => this.channelHandlers.delete(handler);
+  }
+
+  onMessage(handler: MessageHandler): () => void {
+    this.messageHandlers.add(handler);
+    return () => this.messageHandlers.delete(handler);
+  }
+
+  onStateChange(handler: StateHandler): () => void {
+    this.stateHandlers.add(handler);
+    return () => this.stateHandlers.delete(handler);
+  }
+
+  onIceCandidate(handler: IceCandidateHandler): () => void {
+    this.iceCandidateHandlers.add(handler);
+    return () => this.iceCandidateHandlers.delete(handler);
+  }
+
+  // ─── Internals ────────────────────────────────────────
+
+  private getOrCreatePC(peerId: string, isInitiator: boolean): RTCPeerConnection {
+    let pc = this.peers.get(peerId);
+    if (pc) return pc;
+
+    // Use relay servers for better same-machine compatibility
+    const config: RTCConfiguration = {
+      iceServers: RELAY_SERVERS,
+      iceCandidatePoolSize: 10,
+      // Force relay for same-machine (helps with NAT)
+      iceTransportPolicy: "all",
+    };
+
+    pc = new RTCPeerConnection(config);
+
+    // Log ICE gathering state
+    pc.onicegatheringstatechange = () => {
+      console.log("[WebRTC] ICE gathering:", pc!.iceGatheringState, "for", peerId);
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log("[WebRTC] ICE connection:", pc!.iceConnectionState, "for", peerId);
+    };
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        console.log("[WebRTC] ICE candidate:", event.candidate.type, "for", peerId);
+        this.iceCandidateHandlers.forEach((h) => h(peerId, event.candidate!));
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      const state = pc!.connectionState;
+      console.log("[WebRTC] Connection state:", state, "for", peerId);
+      this.stateHandlers.forEach((h) => h(peerId, state));
+    };
+
+    pc.ondatachannel = (event) => {
+      console.log("[WebRTC] Received data channel from", peerId);
+      this.setupChannel(peerId, event.channel);
+    };
+
+    this.peers.set(peerId, pc);
+    console.log("[WebRTC] Created PC for", peerId, isInitiator ? "(initiator)" : "(receiver)");
+    return pc;
+  }
+
+  private setupChannel(peerId: string, channel: RTCDataChannel) {
+    channel.binaryType = "arraybuffer";
+
+    channel.onopen = () => {
+      console.log("[WebRTC] DataChannel OPEN for", peerId);
+      this.channels.set(peerId, channel);
+      this.channelHandlers.forEach((h) => h(peerId, channel));
+    };
+
+    channel.onclose = () => {
+      console.log("[WebRTC] DataChannel CLOSED for", peerId);
+      if (this.channels.get(peerId) === channel) {
+        this.channels.delete(peerId);
+      }
+    };
+
+    channel.onerror = (event) => {
+      console.error("[WebRTC] DataChannel ERROR for", peerId, event);
+    };
+
+    channel.onmessage = (event) => {
+      if (typeof event.data === "string") {
+        try {
+          const message = JSON.parse(event.data) as DataChannelMessage;
+          this.messageHandlers.forEach((h) => h(peerId, message));
+        } catch {
+          console.error("[WebRTC] Failed to parse message");
+        }
+      }
+    };
+  }
+
+  private flushPendingCandidates(peerId: string) {
+    const pending = this.pendingCandidates.get(peerId);
+    if (!pending) return;
+
+    const pc = this.peers.get(peerId);
+    if (!pc) return;
+
+    for (const candidate of pending) {
+      pc.addIceCandidate(candidate).catch(console.error);
+    }
+
+    this.pendingCandidates.delete(peerId);
+  }
+}
+
+// Singleton
+let instance: WebRTCManager | null = null;
+
+export function getWebRTCManager(): WebRTCManager {
+  if (!instance) {
+    instance = new WebRTCManager();
+  }
+  return instance;
+}
