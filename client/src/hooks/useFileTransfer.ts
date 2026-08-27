@@ -183,9 +183,13 @@ export function useFileTransfer() {
 
       receivers.current.set(clientTransferId, receiver);
       receiver.start();
-      // Wait for metadata from sender BEFORE sending accept
-      await receiver.waitForMetadata();
-      receiver.acceptFile(serverTransferId, 0);
+      // Step 3b: Send accept immediately after DataChannel opens
+      console.log("[Transfer] 📡 Sending accept via DataChannel...");
+      webrtc.current.sendMessage(peerId, {
+        type: "accept",
+        transferId: serverTransferId,
+        fileIndex: 0,
+      });
 
       addTransfer({
         id: clientTransferId,
