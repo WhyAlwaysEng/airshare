@@ -148,7 +148,14 @@ export function useFileTransfer() {
       const pending = useAppStore.getState().pendingConsentRequest;
       setPendingConsentRequest(null);
 
-      // RECEIVER waits for DataChannel (sender will create offer)
+      // Step 1: Send TRANSFER_RESPONSE via WebSocket (signaling)
+      console.log("[Transfer] 📡 Sending consent via WebSocket...");
+      signaling.current.send("TRANSFER_RESPONSE", {
+        requestId: serverTransferId,
+        accepted: true,
+      });
+
+      // Step 2: RECEIVER waits for DataChannel (sender will create offer)
       console.log("[Transfer] ⏳ Waiting for WebRTC connection (receiver)...");
       try {
         await waitForDataChannel(peerId);
