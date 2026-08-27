@@ -67,9 +67,7 @@ export class FileSender {
     });
     console.log("[FileSender] Metadata sent, starting chunks...");
 
-    // Consent already handled via WebSocket — no need to wait for DataChannel accept
-
-    // Send chunks with backpressure
+    // Consent already handled via WebSocket — send chunks immediately
     const startTime = Date.now();
     let bytesSent = 0;
     console.log(`[FileSender] Starting chunk send: ${totalChunks} chunks, ${file.size} bytes`);
@@ -83,8 +81,17 @@ export class FileSender {
       const buffer = await chunk.arrayBuffer();
 
       // Wait for backpressure to clear
+      let retries = 0;
       while (!this.webrtc.sendBinary(this.peerId, buffer)) {
-        console.log(`[FileSender] Backpressure: waiting... chunk ${chunkIndex}/${totalChunks}`);
+        if (retries === 0) {
+          console.log(`[FileSender] Backpressure: waiting... chunk ${chunkIndex}/${totalChunks}`);
+        }
+        retries++;
+        if (retries > 100) {
+          console.error("[FileSender] Backpressure timeout (too many retries)");
+          this.callbacks.onError?.(fileIndex, "Transfer stalled: backpressure timeout");
+          return;
+        }
         await this.webrtc.waitForBufferDrain(this.peerId);
         if (this.cancelled) return;
       }
@@ -111,37 +118,7 @@ export class FileSender {
     });
 
     this.callbacks.onProgress?.(fileIndex, 100, 0);
-  }
-
-  private waitForAccept(fileIndex: number): Promise<boolean> {
-    return new Promise((resolve) => {
-      const timeout = setTimeout(() => {
-        unsub();
-        resolve(false);
-      }, 30000); // 30s timeout
-
-      const unsub = this.webrtc.onMessage((peerId, message) => {
-        if (peerId !== this.peerId) return;
-        if (
-          message.type === "accept" &&
-          (message as any).transferId === this.transferId &&
-          (message as any).fileIndex === fileIndex
-        ) {
-          clearTimeout(timeout);
-          unsub();
-          resolve(true);
-        }
-        if (
-          message.type === "decline" &&
-          (message as any).transferId === this.transferId &&
-          (message as any).fileIndex === fileIndex
-        ) {
-          clearTimeout(timeout);
-          unsub();
-          resolve(false);
-        }
-      });
-    });
+    console.log("[FileSender] File complete:", file.name);
   }
 
   cancel() {
@@ -163,9 +140,9 @@ export class FileReceiver {
   private peerId: string;
   private callbacks: TransferCallbacks;
   private incomingFiles = new Map<string, IncomingFileState>(); // key: `${transferId}_${fileIndex}`
-  private binaryBuffer = new Map<string, Uint8Array[]>(); // binary chunk accumulator
   private unsubMessage: (() => void) | null = null;
   private unsubBinary: (() => void) | null = null;
+  private unsubChannel: (() => void) | null = null;
 
   constructor(peerId: string, callbacks: TransferCallbacks = {}) {
     this.peerId = peerId;
@@ -173,16 +150,31 @@ export class FileReceiver {
   }
 
   start() {
+    // Listen for text messages (metadata, complete) via WebRTC manager
     this.unsubMessage = this.webrtc.onMessage((peerId, message) => {
       if (peerId !== this.peerId) return;
       this.handleMessage(message);
     });
 
-    // Listen for binary data via the raw channel
-    // We need to access the DataChannel directly for binary messages
-    const channel = (this.webrtc as any).channels.get(this.peerId) as RTCDataChannel | undefined;
-    if (channel) {
-      this.setupBinaryListener(channel);
+    // Listen for binary messages via WebRTC manager
+    this.unsubBinary = this.webrtc.onBinary((peerId, data) => {
+      if (peerId !== this.peerId) return;
+      this.handleBinary(data);
+    });
+
+    // Also listen for channel open to set up binary listener
+    this.unsubChannel = this.webrtc.onChannel((pid, channel) => {
+      if (pid === this.peerId) {
+        this.setupBinaryListener(channel);
+      }
+    });
+
+    // Check if channel is already open
+    const stats = this.webrtc.getChannelStats(this.peerId);
+    if (stats && stats.readyState === "open") {
+      // Channel already open — need to access it directly
+      // The onChannel handler from usePeers already set up text handling
+      // Binary handling is done via onBinary which was registered above
     }
   }
 
@@ -192,9 +184,9 @@ export class FileReceiver {
     channel.onmessage = (event) => {
       if (event.data instanceof ArrayBuffer) {
         this.handleBinary(event.data);
-      } else {
+      } else if (originalOnMessage) {
         // Text message — let the normal handler process it
-        originalOnMessage?.call(channel, event);
+        originalOnMessage.call(channel, event);
       }
     };
   }
@@ -202,25 +194,7 @@ export class FileReceiver {
   stop() {
     this.unsubMessage?.();
     this.unsubBinary?.();
-  }
-
-  // Wait for metadata from sender before accepting
-  waitForMetadata(): Promise<FileMetadataMessage> {
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        unsub();
-        reject(new Error("Timeout waiting for metadata (15s)"));
-      }, 15000);
-
-      const unsub = this.webrtc.onMessage((peerId, message) => {
-        if (peerId !== this.peerId) return;
-        if (message.type === "metadata") {
-          clearTimeout(timeout);
-          unsub();
-          resolve(message);
-        }
-      });
-    });
+    this.unsubChannel?.();
   }
 
   private handleMessage(message: DataChannelMessage) {
@@ -244,26 +218,21 @@ export class FileReceiver {
       complete: false,
     });
 
-    this.binaryBuffer.set(key, []);
-
-    // Notify consent required
-    this.callbacks.onConsentRequired?.(meta.transferId, this.peerId, [
-      { name: meta.name, size: meta.size, mime: meta.mime },
-    ]);
+    console.log("[FileReceiver] Received metadata:", meta.name, `(${meta.size} bytes, ${meta.totalChunks} chunks)`);
   }
 
   handleBinary(data: ArrayBuffer) {
-    // We need to figure out which file this binary chunk belongs to.
-    // Since DataChannel messages are ordered, the last metadata/complete
-    // message tells us which file we're receiving chunks for.
-    // For simplicity, we assume one file at a time.
+    // Find the active (incomplete) file transfer
     const keys = Array.from(this.incomingFiles.keys());
     const activeKey = keys.find((k) => {
       const state = this.incomingFiles.get(k);
       return state && !state.complete && state.receivedChunks < state.metadata.totalChunks;
     });
 
-    if (!activeKey) return;
+    if (!activeKey) {
+      console.warn("[FileReceiver] Binary data received but no active file transfer");
+      return;
+    }
 
     const state = this.incomingFiles.get(activeKey)!;
     state.chunks.push(data);
@@ -271,30 +240,38 @@ export class FileReceiver {
 
     // Progress
     const progress = (state.receivedChunks / state.metadata.totalChunks) * 100;
+    if (state.receivedChunks % 10 === 0 || state.receivedChunks === state.metadata.totalChunks) {
+      console.log(`[FileReceiver] Received chunk ${state.receivedChunks}/${state.metadata.totalChunks} (${Math.round(progress)}%)`);
+    }
     this.callbacks.onProgress?.(state.metadata.fileIndex, progress, 0);
   }
 
   private async handleComplete(transferId: string, fileIndex: number) {
     const key = `${transferId}_${fileIndex}`;
     const state = this.incomingFiles.get(key);
-    if (!state) return;
+    if (!state) {
+      console.warn("[FileReceiver] Complete received but no state for", key);
+      return;
+    }
 
     state.complete = true;
+    console.log("[FileReceiver] Transfer complete, assembling file...");
 
     // Assemble chunks into Blob
     const blob = new Blob(state.chunks, { type: state.metadata.mime });
 
     // Verify SHA-256
-    this.callbacks.onProgress?.(fileIndex, 100, 0); // Show verifying state
+    this.callbacks.onProgress?.(fileIndex, 100, 0);
 
     try {
       const receivedHash = await computeBlobHash(blob);
       if (receivedHash !== state.metadata.sha256) {
+        console.error("[FileReceiver] SHA-256 mismatch!", receivedHash, "!=", state.metadata.sha256);
         this.callbacks.onError?.(fileIndex, "File integrity check failed (SHA-256 mismatch)");
         return;
       }
 
-      // Hash matches — trigger download
+      console.log("[FileReceiver] SHA-256 verified, triggering download");
       triggerDownload(blob, state.metadata.name);
 
       this.callbacks.onFileReady?.(fileIndex, blob, state.metadata.name);
@@ -302,9 +279,7 @@ export class FileReceiver {
     } catch (err) {
       this.callbacks.onError?.(fileIndex, `Verification failed: ${err}`);
     } finally {
-      // Cleanup
       this.incomingFiles.delete(key);
-      this.binaryBuffer.delete(key);
     }
   }
 
@@ -322,9 +297,7 @@ export class FileReceiver {
       transferId,
       fileIndex,
     });
-    // Cleanup
     const key = `${transferId}_${fileIndex}`;
     this.incomingFiles.delete(key);
-    this.binaryBuffer.delete(key);
   }
 }

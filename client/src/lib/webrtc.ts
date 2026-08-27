@@ -2,18 +2,25 @@ import type { SignalPayload, DataChannelMessage } from "@/types";
 
 type ChannelHandler = (peerId: string, channel: RTCDataChannel) => void;
 type MessageHandler = (peerId: string, message: DataChannelMessage) => void;
+type BinaryHandler = (peerId: string, data: ArrayBuffer) => void;
 type StateHandler = (peerId: string, state: RTCPeerConnectionState) => void;
 type IceCandidateHandler = (peerId: string, candidate: RTCIceCandidate) => void;
 
 // TURN servers for relay (cross-network)
 const TURN_SERVERS: RTCIceServer[] = [
-  // OpenRelay TURN (metered.ca) — multiple endpoints
   {
     urls: [
       "turn:openrelay.metered.ca:80",
       "turn:openrelay.metered.ca:443",
       "turn:openrelay.metered.ca:443?transport=tcp",
       "turn:openrelay.metered.ca:80?transport=tcp",
+    ],
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
+  {
+    urls: [
+      "turn:openrelay.metered.ca:80?transport=udp",
     ],
     username: "openrelayproject",
     credential: "openrelayproject",
@@ -45,6 +52,7 @@ export class WebRTCManager {
 
   private channelHandlers = new Set<ChannelHandler>();
   private messageHandlers = new Set<MessageHandler>();
+  private binaryHandlers = new Set<BinaryHandler>();
   private stateHandlers = new Set<StateHandler>();
   private iceCandidateHandlers = new Set<IceCandidateHandler>();
 
@@ -70,12 +78,24 @@ export class WebRTCManager {
   }
 
   async handleOffer(peerId: string, sdp: string): Promise<SignalPayload> {
+    // Save pending ICE candidates BEFORE removing the old PC
+    const savedCandidates = this.pendingCandidates.get(peerId) || [];
+    
     // Clean up old PC first
     this.removePeer(peerId);
     
     const pc = this.getOrCreatePC(peerId, false); // initiator = false
 
     await pc.setRemoteDescription({ type: "offer", sdp });
+    
+    // Flush any ICE candidates that arrived before the offer
+    if (savedCandidates.length > 0) {
+      console.log(`[WebRTC] Flushing ${savedCandidates.length} pending ICE candidates for`, peerId);
+      for (const candidate of savedCandidates) {
+        await pc.addIceCandidate(candidate).catch(console.error);
+      }
+    }
+    
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
 
@@ -97,14 +117,24 @@ export class WebRTCManager {
 
   async addIceCandidate(peerId: string, candidate: RTCIceCandidateInit): Promise<void> {
     const pc = this.peers.get(peerId);
-    if (!pc) return;
+    
+    if (!pc) {
+      // NO PC YET — store as pending (this is NORMAL when candidates arrive before offer/answer)
+      const pending = this.pendingCandidates.get(peerId) || [];
+      pending.push(candidate);
+      this.pendingCandidates.set(peerId, pending);
+      console.log(`[WebRTC] Stored pending ICE candidate for ${peerId} (no PC yet, queued: ${pending.length})`);
+      return;
+    }
 
     if (pc.remoteDescription) {
       await pc.addIceCandidate(candidate);
+      console.log(`[WebRTC] Added ICE candidate for ${peerId}:`, candidate.candidate?.split(" ").slice(0, 5).join(" "));
     } else {
       const pending = this.pendingCandidates.get(peerId) || [];
       pending.push(candidate);
       this.pendingCandidates.set(peerId, pending);
+      console.log(`[WebRTC] Queued ICE candidate for ${peerId} (no remote desc, queued: ${pending.length})`);
     }
   }
 
@@ -115,13 +145,14 @@ export class WebRTCManager {
       this.peers.delete(peerId);
     }
     this.channels.delete(peerId);
-    this.pendingCandidates.delete(peerId);
+    // NOTE: Do NOT clear pendingCandidates here — they may arrive before offer/answer
   }
 
   closeAll() {
     for (const [peerId] of this.peers) {
       this.removePeer(peerId);
     }
+    this.pendingCandidates.clear();
   }
 
   // ─── Data Sending ─────────────────────────────────────
@@ -129,7 +160,7 @@ export class WebRTCManager {
   sendMessage(peerId: string, message: DataChannelMessage) {
     const channel = this.channels.get(peerId);
     if (!channel || channel.readyState !== "open") {
-      console.warn("[WebRTC] Channel not open for", peerId);
+      console.warn("[WebRTC] Channel not open for", peerId, "(state:", channel?.readyState, ")");
       return;
     }
     channel.send(JSON.stringify(message));
@@ -199,6 +230,11 @@ export class WebRTCManager {
   onMessage(handler: MessageHandler): () => void {
     this.messageHandlers.add(handler);
     return () => this.messageHandlers.delete(handler);
+  }
+
+  onBinary(handler: BinaryHandler): () => void {
+    this.binaryHandlers.add(handler);
+    return () => this.binaryHandlers.delete(handler);
   }
 
   onStateChange(handler: StateHandler): () => void {
@@ -290,17 +326,20 @@ export class WebRTCManager {
         } catch {
           console.error("[WebRTC] Failed to parse message");
         }
+      } else if (event.data instanceof ArrayBuffer) {
+        this.binaryHandlers.forEach((h) => h(peerId, event.data));
       }
     };
   }
 
   private flushPendingCandidates(peerId: string) {
     const pending = this.pendingCandidates.get(peerId);
-    if (!pending) return;
+    if (!pending || pending.length === 0) return;
 
     const pc = this.peers.get(peerId);
     if (!pc) return;
 
+    console.log(`[WebRTC] Flushing ${pending.length} pending ICE candidates for`, peerId);
     for (const candidate of pending) {
       pc.addIceCandidate(candidate).catch(console.error);
     }

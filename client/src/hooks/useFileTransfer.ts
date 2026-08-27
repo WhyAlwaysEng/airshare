@@ -7,6 +7,73 @@ import type { Transfer } from "@/types";
 
 let transferIdCounter = 0;
 
+/**
+ * Wait for a DataChannel to open for the given peer.
+ * Handles race conditions: channel may already be open when this is called,
+ * or it may open while we're waiting.
+ */
+function waitForDataChannel(
+  webrtcManager: ReturnType<typeof getWebRTCManager>,
+  peerId: string,
+  timeoutMs = 20000
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // 1) Check if DataChannel is ALREADY open (race condition guard)
+    const existing = webrtcManager.getChannelStats(peerId);
+    if (existing && existing.readyState === "open") {
+      console.log(`[WebRTC] DataChannel already open for ${peerId}`);
+      resolve();
+      return;
+    }
+
+    let resolved = false;
+    const cleanup = () => {
+      resolved = true;
+      clearTimeout(timer);
+      unsubChannel();
+      unsubState();
+    };
+
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        cleanup();
+        reject(new Error(`DataChannel timeout (${timeoutMs}ms) for ${peerId}`));
+      }
+    }, timeoutMs);
+
+    const unsubChannel = webrtcManager.onChannel((pid) => {
+      if (pid === peerId && !resolved) {
+        console.log(`[WebRTC] ✅ DataChannel opened for ${peerId}`);
+        cleanup();
+        resolve();
+      }
+    });
+
+    const unsubState = webrtcManager.onStateChange((pid, state) => {
+      if (pid === peerId && state === "failed" && !resolved) {
+        console.error(`[WebRTC] ❌ Connection failed for ${peerId}`);
+        cleanup();
+        reject(new Error(`WebRTC connection failed for ${peerId}`));
+      }
+    });
+
+    // 2) Periodic check as backup (in case event was missed)
+    const poll = setInterval(() => {
+      if (resolved) {
+        clearInterval(poll);
+        return;
+      }
+      const stats = webrtcManager.getChannelStats(peerId);
+      if (stats && stats.readyState === "open") {
+        console.log(`[WebRTC] ✅ DataChannel detected open (poll) for ${peerId}`);
+        cleanup();
+        clearInterval(poll);
+        resolve();
+      }
+    }, 500);
+  });
+}
+
 export function useFileTransfer() {
   const {
     addTransfer,
@@ -31,7 +98,7 @@ export function useFileTransfer() {
       const peers = useAppStore.getState().peers;
       const peer = peers.get(fromId);
 
-      console.log("[Transfer] 📥 Incoming request from", peer?.name, request);
+      console.log("[Transfer] 📥 Incoming request from", peer?.name);
 
       setPendingConsentRequest({
         transferId: request.id,
@@ -80,7 +147,7 @@ export function useFileTransfer() {
         })),
       });
 
-      // Step 2: Wait for consent
+      // Step 2: Wait for consent via WebSocket
       console.log("[Transfer] ⏳ Waiting for consent...");
       const accepted = await new Promise<boolean>((resolve) => {
         const timeout = setTimeout(() => {
@@ -104,12 +171,27 @@ export function useFileTransfer() {
         return;
       }
 
-      // Step 3: SENDER creates WebRTC offer
+      // Step 3: Establish WebRTC connection
       console.log("[Transfer] 🔗 Establishing WebRTC (sender creates offer)...");
       updateTransfer(transferId, { status: "transferring" });
 
       try {
-        await waitForDataChannel(peerId);
+        // Clean up any old PC for this peer
+        webrtc.current.removePeer(peerId);
+
+        // Sender creates offer (with DataChannel inside)
+        const offer = await webrtc.current.createOffer(peerId);
+        signaling.current.send("SIGNAL", {
+          targetId: peerId,
+          signal: offer,
+        });
+
+        console.log("[Transfer] ⏳ Offer sent, waiting for DataChannel...");
+
+        // Wait for DataChannel to open (with race condition guard)
+        await waitForDataChannel(webrtc.current, peerId, 20000);
+
+        console.log("[Transfer] ✅ DataChannel ready!");
       } catch (err) {
         console.error("[Transfer] ❌ WebRTC failed:", err);
         failTransfer(transferId, "WebRTC connection failed");
@@ -117,8 +199,8 @@ export function useFileTransfer() {
         return;
       }
 
-      // Step 4: Send files
-      console.log("[Transfer] 🚀 Starting transfer...");
+      // Step 4: Send files via DataChannel
+      console.log("[Transfer] 🚀 Sending files...");
       const sender = new FileSender(transferId, peerId, files, {
         onProgress: (fileIndex, progress, speed) => {
           updateTransferFileProgress(transferId, fileIndex, progress, speed);
@@ -144,28 +226,11 @@ export function useFileTransfer() {
   const acceptTransfer = useCallback(
     async (serverTransferId: string, peerId: string) => {
       console.log("[Transfer] ✅ Accepting from", peerId);
-      // Save pending data BEFORE clearing
       const pending = useAppStore.getState().pendingConsentRequest;
       setPendingConsentRequest(null);
 
-      // Step 1: Send TRANSFER_RESPONSE via WebSocket (signaling)
-      console.log("[Transfer] 📡 Sending consent via WebSocket...");
-      signaling.current.send("TRANSFER_RESPONSE", {
-        requestId: serverTransferId,
-        accepted: true,
-      });
-
-      // Step 2: RECEIVER waits for sender's offer (don't create offer!)
-      console.log("[Transfer] ⏳ Waiting for sender's WebRTC offer...");
-      try {
-        await waitForSenderOffer(peerId);
-      } catch (err) {
-        console.error("[Transfer] ❌ WebRTC failed on receiver:", err);
-        addToast({ type: "error", title: "Connection failed" });
-        return;
-      }
-
-      // Step 3: Create receiver and accept
+      // Step 1: Create receiver and start listening BEFORE consent response
+      // This ensures the receiver is ready when the sender's offer arrives
       const clientTransferId = `recv_${++transferIdCounter}`;
       const receiver = new FileReceiver(peerId, {
         onProgress: (fileIndex, progress) => {
@@ -183,13 +248,6 @@ export function useFileTransfer() {
 
       receivers.current.set(clientTransferId, receiver);
       receiver.start();
-      // Step 3b: Send accept immediately after DataChannel opens
-      console.log("[Transfer] 📡 Sending accept via DataChannel...");
-      webrtc.current.sendMessage(peerId, {
-        type: "accept",
-        transferId: serverTransferId,
-        fileIndex: 0,
-      });
 
       addTransfer({
         id: clientTransferId,
@@ -200,6 +258,23 @@ export function useFileTransfer() {
         files: (pending?.files || []).map((f) => ({ ...f, progress: 0 })),
         startedAt: Date.now(),
       });
+
+      // Step 2: Send consent via WebSocket
+      signaling.current.send("TRANSFER_RESPONSE", {
+        requestId: serverTransferId,
+        accepted: true,
+      });
+
+      // Step 3: Wait for DataChannel to open (sender creates offer, we receive it)
+      console.log("[Transfer] ⏳ Waiting for sender's WebRTC connection...");
+      try {
+        await waitForDataChannel(webrtc.current, peerId, 25000);
+        console.log("[Transfer] ✅ DataChannel ready (receiver)!");
+      } catch (err) {
+        console.error("[Transfer] ❌ WebRTC failed on receiver:", err);
+        addToast({ type: "error", title: "Connection failed" });
+        return;
+      }
     },
     [addTransfer, updateTransferFileProgress, completeTransfer, failTransfer, addToast, setPendingConsentRequest]
   );
@@ -225,119 +300,4 @@ export function useFileTransfer() {
   }, []);
 
   return { sendFiles, acceptTransfer, declineTransfer, sendText };
-}
-
-// ─── Wait for DataChannel to open ────────────────────────
-
-async function waitForDataChannel(peerId: string): Promise<void> {
-  const webrtc = getWebRTCManager();
-  const signaling = getSignalingClient();
-
-  // Check if already connected
-  const existingChannel = (webrtc as any).channels.get(peerId);
-  if (existingChannel?.readyState === "open") {
-    console.log("[WebRTC] ✅ Already connected to", peerId);
-    return;
-  }
-
-  // Create offer (sender initiates)
-  console.log("[WebRTC] 📡 Creating offer for", peerId);
-  const offer = await webrtc.createOffer(peerId);
-  signaling.send("SIGNAL", {
-    targetId: peerId,
-    signal: offer,
-  });
-
-  // Wait for DataChannel to open (with 20s timeout)
-  return new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      unsub();
-      unsubState();
-      console.error("[WebRTC] ❌ Timeout waiting for DataChannel");
-      reject(new Error("WebRTC connection timeout (20s)"));
-    }, 20000);
-
-    const unsub = webrtc.onChannel((pid, _channel) => {
-      if (pid === peerId) {
-        console.log("[WebRTC] ✅ DataChannel opened with", peerId);
-        clearTimeout(timeout);
-        unsub();
-        unsubState();
-        resolve();
-      }
-    });
-
-    const unsubState = webrtc.onStateChange((pid, state) => {
-      if (pid === peerId) {
-        console.log("[WebRTC] State:", state, "for", peerId);
-        if (state === "connected") {
-          const ch = (webrtc as any).channels.get(peerId);
-          if (ch?.readyState === "open") {
-            clearTimeout(timeout);
-            unsub();
-            unsubState();
-            resolve();
-          }
-        } else if (state === "failed") {
-          clearTimeout(timeout);
-          unsub();
-          unsubState();
-          reject(new Error("WebRTC connection failed"));
-        }
-      }
-    });
-  });
-}
-
-// ─── Wait for sender's offer (receiver side) ────────────
-// Receiver does NOT create an offer, just waits for DataChannel
-async function waitForSenderOffer(peerId: string): Promise<void> {
-  const webrtc = getWebRTCManager();
-
-  // Check if already connected
-  const existingChannel = (webrtc as any).channels.get(peerId);
-  if (existingChannel?.readyState === "open") {
-    console.log("[WebRTC] ✅ Already connected to", peerId);
-    return;
-  }
-
-  // Wait for DataChannel to open (sender creates offer, we just wait)
-  console.log("[WebRTC] ⏳ Waiting for sender's offer...");
-  return new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      unsub();
-      unsubState();
-      console.error("[WebRTC] ❌ Timeout waiting for sender");
-      reject(new Error("Timeout waiting for sender (20s)"));
-    }, 20000);
-
-    const unsub = webrtc.onChannel((pid, _channel) => {
-      if (pid === peerId) {
-        console.log("[WebRTC] ✅ DataChannel received from", peerId);
-        clearTimeout(timeout);
-        unsub();
-        unsubState();
-        resolve();
-      }
-    });
-
-    const unsubState = webrtc.onStateChange((pid, state) => {
-      if (pid === peerId) {
-        if (state === "connected") {
-          const ch = (webrtc as any).channels.get(peerId);
-          if (ch?.readyState === "open") {
-            clearTimeout(timeout);
-            unsub();
-            unsubState();
-            resolve();
-          }
-        } else if (state === "failed") {
-          clearTimeout(timeout);
-          unsub();
-          unsubState();
-          reject(new Error("WebRTC connection failed"));
-        }
-      }
-    });
-  });
 }
