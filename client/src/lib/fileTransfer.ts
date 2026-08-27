@@ -198,6 +198,25 @@ export class FileReceiver {
     this.unsubBinary?.();
   }
 
+  // Wait for metadata from sender before accepting
+  waitForMetadata(): Promise<FileMetadataMessage> {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        unsub();
+        reject(new Error("Timeout waiting for metadata (15s)"));
+      }, 15000);
+
+      const unsub = this.webrtc.onMessage((peerId, message) => {
+        if (peerId !== this.peerId) return;
+        if (message.type === "metadata") {
+          clearTimeout(timeout);
+          unsub();
+          resolve(message);
+        }
+      });
+    });
+  }
+
   private handleMessage(message: DataChannelMessage) {
     switch (message.type) {
       case "metadata":

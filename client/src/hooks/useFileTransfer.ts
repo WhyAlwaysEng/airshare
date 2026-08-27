@@ -183,6 +183,8 @@ export function useFileTransfer() {
 
       receivers.current.set(clientTransferId, receiver);
       receiver.start();
+      // Wait for metadata from sender BEFORE sending accept
+      await receiver.waitForMetadata();
       receiver.acceptFile(serverTransferId, 0);
 
       addTransfer({
