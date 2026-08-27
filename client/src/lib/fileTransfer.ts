@@ -65,12 +65,9 @@ export class FileSender {
       sha256,
       totalChunks,
     });
-    console.log("[FileSender] Metadata sent, waiting for accept...");
+    console.log("[FileSender] Metadata sent, starting chunks...");
 
-    // Wait for accept
-    const accepted = await this.waitForAccept(fileIndex);
-    console.log("[FileSender] Accept result:", accepted);
-    if (!accepted || this.cancelled) return;
+    // Consent already handled via WebSocket — no need to wait for DataChannel accept
 
     // Send chunks with backpressure
     const startTime = Date.now();
